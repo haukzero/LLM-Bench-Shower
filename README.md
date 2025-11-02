@@ -25,7 +25,7 @@ TBA
 - C-Eval
     - 中文多学科专业知识
     - NIPS'23
-    - [https://github.com/hkust-nlp/ceval?tab=readme-ov-file](https://github.com/hkust-nlp/ceval?tab=readme-ov-file)
+    - [https://github.com/hkust-nlp/ceval](https://github.com/hkust-nlp/ceval)
 - CMMMU
     - 中文多学科通识型知识
     - CORR'24
