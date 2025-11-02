@@ -1,5 +1,6 @@
 {
     "LongBench": [
+        "LongBench",
         "2wikimqa",
         "2wikimqa_e",
         "dureader",
@@ -36,6 +37,7 @@
         "vcsum"
     ],
     "LongBenchV2": [
+        "LongBenchV2",
         "Code_Repository_Understanding",
         "Long-dialogue_History_Understanding",
         "Long_In-context_Learning",
@@ -47,6 +49,7 @@
         "MR-GMS8K"
     ],
     "C-Eval": [
+        "C-Eval",
         "accountant",
         "advanced_mathematics",
         "art_studies",
@@ -101,6 +104,7 @@
         "veterinary_medicine"
     ],
     "CMMMU": [
+        "CMMMU",
         "art_and_design",
         "business",
         "health_and_medicine",
