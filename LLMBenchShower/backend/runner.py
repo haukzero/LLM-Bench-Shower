@@ -2,6 +2,7 @@ import gc
 import torch
 import threading
 import time
+import queue
 from collections import defaultdict
 from typing import Dict, Tuple, List, Any, NamedTuple, Set
 from openai import Client
@@ -17,6 +18,12 @@ from model_cache import ModelCache
 class ModelDatasetPair(NamedTuple):
     model_name: str
     dataset_name: str
+
+
+class BenchResponse(NamedTuple):
+    req_id: str
+    result: Dict[str, Any]
+    error: str | None = None
 
 
 _LLM_BENCHMARKER_RUNNER = None
@@ -37,6 +44,9 @@ class LLMBenchRunner:
         # Load existing results from database into memory
         self._load_history_from_db()
 
+        self.input_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
+        self.output_queue: queue.Queue[BenchResponse] = queue.Queue()
+
         # Start background write-back thread
         self._stop_writeback = threading.Event()
         self._writeback_interval = envs.LBS_DB_WRITEBACK_S
@@ -44,6 +54,12 @@ class LLMBenchRunner:
             target=self._writeback_worker, daemon=True, name="DBWriteBackThread"
         )
         self._writeback_thread.start()
+
+        self._stop_consumer = threading.Event()
+        self._consumer_thread = threading.Thread(
+            target=self._consumer_worker, daemon=True, name="BenchConsumerThread"
+        )
+        self._consumer_thread.start()
 
         self.device_map = envs.LBS_LOCAL_DEVICE_MAP
         self.use_model_cache = envs.LBS_USE_MODEL_CACHE
@@ -70,6 +86,45 @@ class LLMBenchRunner:
     def _writeback_worker(self):
         while not self._stop_writeback.wait(timeout=self._writeback_interval):
             self._flush_dirty_results()
+
+    def _consumer_worker(self):
+        while not self._stop_consumer.is_set():
+            try:
+                request = self.input_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            # Extract req_id from request
+            req_id = request.get("req_id")
+            if not req_id:
+                print("Warning: Request without req_id received, skipping")
+                self.input_queue.task_done()
+                continue
+
+            try:
+                # Process the request (exclude req_id from processing params)
+                result = self._process_single_request(request)
+                # Put result in output queue
+                response = BenchResponse(req_id=req_id, result=result, error=None)
+                self.output_queue.put(response)
+            except Exception as e:
+                # Put error response in output queue
+                error_msg = f"Error processing request: {str(e)}"
+                response = BenchResponse(req_id=req_id, result={}, error=error_msg)
+                self.output_queue.put(response)
+            finally:
+                self.input_queue.task_done()
+
+    def _process_single_request(self, request: Dict[str, Any]) -> Dict:
+        """Process a single benchmark request."""
+        model_type: bytes = request.get("model_type", b"local")
+        match model_type:
+            case b"local":
+                return self.eval_local_model_fn(**request)
+            case b"api":
+                return self.eval_api_model(**request)
+            case _:
+                raise ValueError(f"Unknown model_type: {model_type}")
 
     def _mark_dirty(self, pair: ModelDatasetPair):
         with self._dirty_lock:
@@ -205,17 +260,52 @@ class LLMBenchRunner:
         self._mark_dirty(pair)
         return benchmark_results
 
-    def eval_models(self, requests: List[Dict[str, Any]]) -> List[Dict]:
+    def submit_request(self, request: Dict[str, Any]):
+        if "req_id" not in request:
+            raise ValueError("Request must contain 'req_id' field")
+        elif "model_type" not in request or request["model_type"] not in [
+            b"local",
+            b"api",
+        ]:
+            raise ValueError("Request must contain valid 'model_type' field")
+        self.input_queue.put(request)
+
+    def submit_requests(self, requests: List[Dict[str, Any]]):
+        for request in requests:
+            self.submit_request(request)
+
+    def get_result(self, timeout: float = None) -> BenchResponse:
+        return self.output_queue.get(timeout=timeout)
+
+    def get_results(
+        self,
+        count: int | None = None,
+        timeout: float | None = None,
+    ) -> List[BenchResponse]:
+        """Get multiple results from the output queue.
+
+        Args:
+            count: Number of results to retrieve (None = all available)
+            timeout: Maximum time to wait for each result
+
+        Returns:
+            List of BenchResponse objects
+        """
         results = []
-        for req in requests:
-            model_type: bytes = req.get("model_type", b"local")
-            match model_type:
-                case b"local":
-                    results.append(self.eval_local_model_fn(**req))
-                case b"api":
-                    results.append(self.eval_api_model(**req))
-                case _:
-                    raise ValueError(f"Unknown model_type: {model_type}")
+        try:
+            if count is None:
+                # Get all available results without blocking
+                while True:
+                    try:
+                        results.append(self.output_queue.get_nowait())
+                    except queue.Empty:
+                        break
+            else:
+                # Get specific number of results
+                for _ in range(count):
+                    results.append(self.output_queue.get(timeout=timeout))
+        except queue.Empty:
+            pass
         return results
 
     def get_database_stats(self) -> Dict:
@@ -270,6 +360,11 @@ class LLMBenchRunner:
 
     def close(self):
         """Clean up resources and flush all pending writes."""
+        # Stop the consumer thread
+        self._stop_consumer.set()
+        if self._consumer_thread.is_alive():
+            self._consumer_thread.join(timeout=5.0)
+
         # Stop the write-back thread
         self._stop_writeback.set()
         if self._writeback_thread.is_alive():
