@@ -1,0 +1,7 @@
+import os
+
+LBS_LOCAL_DEVICE_MAP = os.getenv("LBS_LOCAL_DEVICE_MAP", "auto")
+LBS_USE_MODEL_CACHE = bool(int(os.getenv("LBS_USE_MODEL_CACHE", "1")))
+LBS_MAX_CACHED_LOCAL_MODELS = int(os.getenv("LBS_MAX_CACHED_LOCAL_MODELS", "4"))
+LBS_GPU_MAX_UTILIZATION = float(os.getenv("LBS_GPU_MAX_UTILIZATION", "0.5"))
+LBS_CPU_MAX_UTILIZATION = float(os.getenv("LBS_CPU_MAX_UTILIZATION", "0.8"))
