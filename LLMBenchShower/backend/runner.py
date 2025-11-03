@@ -1,12 +1,15 @@
 import gc
 import torch
+import threading
+import time
 from collections import defaultdict
-from typing import Dict, Tuple, List, Any, NamedTuple
+from typing import Dict, Tuple, List, Any, NamedTuple, Set
 from openai import Client
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import envs
 from bench import init_all_benchmarkers
 from bench.utils import get_available_datasets
+from db import BenchmarkDatabase
 from model_cache import ModelCache
 
 
@@ -22,8 +25,26 @@ _LLM_BENCHMARKER_RUNNER = None
 class LLMBenchRunner:
     def __init__(self):
         self.available_datasets = get_available_datasets()
-        self.bench_history: Dict[ModelDatasetPair, Dict] = defaultdict(dict)
         self.benchmarkers = init_all_benchmarkers()
+
+        self.db = BenchmarkDatabase(envs.LBS_DB_PATH)
+        # Keep in-memory cache for fast access during runtime
+        self.bench_history: Dict[ModelDatasetPair, Dict] = defaultdict(dict)
+        # Track which results need to be written to database
+        self._dirty_results: Set[ModelDatasetPair] = set()
+        self._dirty_lock = threading.Lock()
+
+        # Load existing results from database into memory
+        self._load_history_from_db()
+
+        # Start background write-back thread
+        self._stop_writeback = threading.Event()
+        self._writeback_interval = envs.LBS_DB_WRITEBACK_S
+        self._writeback_thread = threading.Thread(
+            target=self._writeback_worker, daemon=True, name="DBWriteBackThread"
+        )
+        self._writeback_thread.start()
+
         self.device_map = envs.LBS_LOCAL_DEVICE_MAP
         self.use_model_cache = envs.LBS_USE_MODEL_CACHE
         if self.use_model_cache:
@@ -39,6 +60,47 @@ class LLMBenchRunner:
             self.eval_local_model_fn = self.eval_local_model_cached
         else:
             self.eval_local_model_fn = self.eval_local_model_uncached
+
+    def _load_history_from_db(self):
+        all_results = self.db.get_all_results()
+        for model_name, dataset_name, results, _, _ in all_results:
+            pair = ModelDatasetPair(model_name, dataset_name)
+            self.bench_history[pair] = results
+
+    def _writeback_worker(self):
+        while not self._stop_writeback.wait(timeout=self._writeback_interval):
+            self._flush_dirty_results()
+
+    def _mark_dirty(self, pair: ModelDatasetPair):
+        with self._dirty_lock:
+            self._dirty_results.add(pair)
+
+    def _flush_dirty_results(self):
+        with self._dirty_lock:
+            if not self._dirty_results:
+                return
+
+            # Copy and clear the dirty set
+            dirty_pairs = list(self._dirty_results)
+            self._dirty_results.clear()
+
+        # Prepare batch data
+        batch_data = []
+        for pair in dirty_pairs:
+            if pair in self.bench_history:
+                batch_data.append(
+                    (pair.model_name, pair.dataset_name, self.bench_history[pair])
+                )
+
+        # Write to database
+        if batch_data:
+            try:
+                self.db.save_results_batch(batch_data)
+            except Exception as e:
+                # If write fails, mark them as dirty again
+                print(f"Warning: Failed to write results to database: {e}")
+                with self._dirty_lock:
+                    self._dirty_results.update(dirty_pairs)
 
     def _split_dataset_name(self, dataset_name: str) -> Tuple[str, str]:
         try:
@@ -61,8 +123,9 @@ class LLMBenchRunner:
         *args,
         **kwargs,
     ) -> Dict:
-        if (model_name_or_path, dataset_name) in self.bench_history:
-            return self.bench_history[(model_name_or_path, dataset_name)]
+        pair = ModelDatasetPair(model_name_or_path, dataset_name)
+        if pair in self.bench_history:
+            return self.bench_history[pair]
         supdataset_name, subdataset_name = self._split_dataset_name(dataset_name)
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -77,7 +140,9 @@ class LLMBenchRunner:
             *args,
             **kwargs,
         )
-        self.bench_history[(model_name_or_path, dataset_name)] = benchmark_results
+        # Save to memory and mark for write-back
+        self.bench_history[pair] = benchmark_results
+        self._mark_dirty(pair)
 
         del model
         del tokenizer
@@ -93,8 +158,9 @@ class LLMBenchRunner:
         *args,
         **kwargs,
     ) -> Dict:
-        if (model_name_or_path, dataset_name) in self.bench_history:
-            return self.bench_history[(model_name_or_path, dataset_name)]
+        pair = ModelDatasetPair(model_name_or_path, dataset_name)
+        if pair in self.bench_history:
+            return self.bench_history[pair]
         supdataset_name, subdataset_name = self._split_dataset_name(dataset_name)
 
         # Use model cache to get model and tokenizer
@@ -107,7 +173,9 @@ class LLMBenchRunner:
             *args,
             **kwargs,
         )
-        self.bench_history[(model_name_or_path, dataset_name)] = benchmark_results
+        # Save to memory and mark for write-back
+        self.bench_history[pair] = benchmark_results
+        self._mark_dirty(pair)
         return benchmark_results
 
     def eval_api_model(
@@ -120,8 +188,9 @@ class LLMBenchRunner:
         **kwargs,
     ) -> Dict:
         api_model_name = f"api::{model_name}"
-        if (api_model_name, dataset_name) in self.bench_history:
-            return self.bench_history[(api_model_name, dataset_name)]
+        pair = ModelDatasetPair(api_model_name, dataset_name)
+        if pair in self.bench_history:
+            return self.bench_history[pair]
         supdataset_name, subdataset_name = self._split_dataset_name(dataset_name)
         client = Client(api_key=openai_api_key, base_url=base_url)
         benchmark_results = self.benchmarkers[supdataset_name].evaluate_api_llm(
@@ -131,7 +200,9 @@ class LLMBenchRunner:
             *args,
             **kwargs,
         )
-        self.bench_history[(api_model_name, dataset_name)] = benchmark_results
+        # Save to memory and mark for write-back
+        self.bench_history[pair] = benchmark_results
+        self._mark_dirty(pair)
         return benchmark_results
 
     def eval_models(self, requests: List[Dict[str, Any]]) -> List[Dict]:
@@ -147,9 +218,68 @@ class LLMBenchRunner:
                     raise ValueError(f"Unknown model_type: {model_type}")
         return results
 
+    def get_database_stats(self) -> Dict:
+        return self.db.get_stats()
+
+    def get_all_history(self) -> List[Tuple[str, str, Dict, str, str]]:
+        return self.db.get_all_results()
+
+    def clear_history(self, model_name: str = None, dataset_name: str = None) -> int:
+        """Clear benchmark history.
+
+        Args:
+            model_name: If specified, only clear results for this model
+            dataset_name: If specified, only clear results for this dataset
+
+        Returns:
+            Number of results cleared
+        """
+        if model_name and dataset_name:
+            # Clear specific result
+            pair = ModelDatasetPair(model_name, dataset_name)
+            if pair in self.bench_history:
+                del self.bench_history[pair]
+            # Remove from dirty set if present
+            with self._dirty_lock:
+                self._dirty_results.discard(pair)
+            return 1 if self.db.delete_result(model_name, dataset_name) else 0
+        elif model_name or dataset_name:
+            # Clear by model or dataset - need to iterate
+            count = 0
+            to_delete = []
+            for pair in self.bench_history.keys():
+                if (model_name and pair.model_name == model_name) or (
+                    dataset_name and pair.dataset_name == dataset_name
+                ):
+                    to_delete.append(pair)
+            for pair in to_delete:
+                del self.bench_history[pair]
+                # Remove from dirty set if present
+                with self._dirty_lock:
+                    self._dirty_results.discard(pair)
+                if self.db.delete_result(pair.model_name, pair.dataset_name):
+                    count += 1
+            return count
+        else:
+            # Clear all
+            self.bench_history.clear()
+            # Clear dirty set
+            with self._dirty_lock:
+                self._dirty_results.clear()
+            return self.db.clear_all_results()
+
     def close(self):
-        self.model_cache.clear_cache()
-        del self.bench_history
+        """Clean up resources and flush all pending writes."""
+        # Stop the write-back thread
+        self._stop_writeback.set()
+        if self._writeback_thread.is_alive():
+            self._writeback_thread.join(timeout=5.0)
+
+        # Flush any remaining dirty results
+        self._flush_dirty_results()
+
+        if self.use_model_cache:
+            self.model_cache.clear_cache()
 
 
 def get_llm_bench_runner():

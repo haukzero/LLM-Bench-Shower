@@ -34,3 +34,6 @@ ENV/
 *.sublime-workspace
 *.sublime-project
 
+# SQLite database files
+*.db
+*.sqlite
