@@ -1,9 +1,9 @@
 import gc
 import psutil
+import time
 import torch
 from accelerate import dispatch_model
 from accelerate.hooks import remove_hook_from_module
-from collections import OrderedDict
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from typing import Dict, NamedTuple
 
@@ -33,12 +33,76 @@ class ModelMeta(NamedTuple):
     device_map: Dict | None = None
 
 
+class ModelStats:
+    """Track statistics for each cached model."""
+
+    def __init__(self, estimated_memory: int):
+        self.access_count = 1
+        self.last_access_time = time.time()
+        self.load_time = time.time()
+        self.estimated_memory = estimated_memory
+
+    def update_access(self):
+        """Update access statistics."""
+        self.access_count += 1
+        self.last_access_time = time.time()
+
+    def calculate_score(self, current_time: float, total_cache_memory: int) -> float:
+        """
+        Calculate a score for the model based on multiple factors.
+        Higher score means higher priority to keep in cache.
+
+        Factors:
+        1. Access frequency: More frequent access = higher priority
+        2. Recency: More recent access = higher priority
+        3. Model size: Smaller models are easier to evict/reload
+        4. Time in cache: Newly loaded models get a temporary boost
+
+        Returns:
+            float: Priority score (higher is better)
+        """
+        # Frequency component (0-1 normalized by log scale)
+        # More accesses = higher score
+        frequency_score = min(1.0, (self.access_count**0.5) / 10.0)
+
+        # Recency component (decay over time)
+        # Recent access within 5 minutes gets high score
+        time_since_access = current_time - self.last_access_time
+        recency_score = max(
+            0.0, 1.0 - (time_since_access / 300.0)
+        )  # 300 seconds = 5 minutes
+
+        # Size component (inverse relationship)
+        # Smaller models get lower penalty for eviction
+        # Normalize by total cache capacity
+        size_ratio = self.estimated_memory / total_cache_memory
+        size_score = 1.0 - min(1.0, size_ratio)
+
+        # New model boost (gradually decays)
+        # Gives newly loaded models a chance to prove their worth
+        time_in_cache = current_time - self.load_time
+        newness_bonus = max(
+            0.0, 1.0 - (time_in_cache / 60.0)
+        )  # 60 seconds grace period
+
+        # Weighted combination
+        # Frequency and recency are most important
+        score = (
+            frequency_score * 0.4
+            + recency_score * 0.35
+            + size_score * 0.15
+            + newness_bonus * 0.1
+        )
+
+        return score
+
+
 class ModelPair(NamedTuple):
     model: AutoModelForCausalLM
     tokenizer: AutoTokenizer
 
 
-class LRUModelCache:
+class ModelCache:
     def __init__(
         self,
         max_cached_models: int,
@@ -54,9 +118,12 @@ class LRUModelCache:
         self._verify_device_map()
 
         # GPU cache: stores models on GPU
-        self.gpu_cache: OrderedDict[str, ModelMeta] = OrderedDict()
+        self.gpu_cache: Dict[str, ModelMeta] = {}
         # CPU cache: stores models offloaded to CPU
-        self.cpu_cache: OrderedDict[str, ModelMeta] = OrderedDict()
+        self.cpu_cache: Dict[str, ModelMeta] = {}
+
+        # Statistics tracking for smart eviction
+        self.model_stats: Dict[str, ModelStats] = {}
 
         # Track GPU memory usage
         self.gpu_devices = self._get_gpu_devices()
@@ -335,6 +402,41 @@ class LRUModelCache:
             device_id = self.gpu_devices[0] if self.gpu_devices else 0
             return torch.cuda.memory_allocated(device_id)
 
+    def _select_eviction_candidate(
+        self, cache: Dict[str, ModelMeta], cache_type: str = "gpu"
+    ) -> str:
+        """
+        Select the best candidate for eviction based on comprehensive scoring.
+
+        Args:
+            cache: The cache (gpu_cache or cpu_cache) to select from
+            cache_type: Type of cache ("gpu" or "cpu")
+
+        Returns:
+            str: Model name to evict
+        """
+        if not cache:
+            raise ValueError(
+                f"Cannot select eviction candidate from empty {cache_type} cache"
+            )
+
+        current_time = time.time()
+
+        # Calculate total memory in the cache for normalization
+        total_cache_memory = sum(meta.estimated_memory for meta in cache.values())
+
+        # Calculate scores for all models in the cache
+        model_scores = {}
+        for model_name in cache.keys():
+            stats = self.model_stats[model_name]
+            score = stats.calculate_score(current_time, total_cache_memory)
+            model_scores[model_name] = score
+
+        # Select model with lowest score (least valuable to keep)
+        eviction_candidate = min(model_scores, key=model_scores.get)
+
+        return eviction_candidate
+
     def _move_model_to_cpu(self, model_name: str):
         """Move a model from GPU cache to CPU cache."""
         if model_name not in self.gpu_cache:
@@ -397,10 +499,11 @@ class LRUModelCache:
         tokenizer = cpu_model_meta.tokenizer
         estimated_memory = cpu_model_meta.estimated_memory
 
-        # Delete model
+        # Delete model and stats
         del model
         del tokenizer
         del self.cpu_cache[model_name]
+        del self.model_stats[model_name]
         self.current_cpu_usage -= estimated_memory
         gc.collect()
 
@@ -411,15 +514,15 @@ class LRUModelCache:
             if current_usage + required_memory <= self.available_gpu_memory:
                 return
 
-            # Evict least recently used model from GPU to CPU
-            lru_model_name = next(iter(self.gpu_cache))
+            # Use smart eviction: select model with lowest score
+            eviction_candidate = self._select_eviction_candidate(self.gpu_cache, "gpu")
 
             # Check if we need to make space on CPU first
-            lru_memory = self.gpu_cache[lru_model_name].estimated_memory
-            if self.current_cpu_usage + lru_memory > self.available_cpu_memory:
-                self._make_space_on_cpu(lru_memory)
+            candidate_memory = self.gpu_cache[eviction_candidate].estimated_memory
+            if self.current_cpu_usage + candidate_memory > self.available_cpu_memory:
+                self._make_space_on_cpu(candidate_memory)
 
-            self._move_model_to_cpu(lru_model_name)
+            self._move_model_to_cpu(eviction_candidate)
 
     def _make_space_on_cpu(self, required_memory: int):
         """Evict models from CPU until there's enough space."""
@@ -427,24 +530,28 @@ class LRUModelCache:
             if self.current_cpu_usage + required_memory <= self.available_cpu_memory:
                 return
 
-            # Evict least recently used model from CPU
-            lru_model_name = next(iter(self.cpu_cache))
-            self._evict_from_cpu(lru_model_name)
+            # Use smart eviction: select model with lowest score from CPU cache
+            eviction_candidate = self._select_eviction_candidate(self.cpu_cache, "cpu")
+            self._evict_from_cpu(eviction_candidate)
 
     def _enforce_model_count_limit(self, total_models: int):
         """Ensure total cached models don't exceed max_cached_models."""
         while total_models > self.max_cached_models:
             # First try to evict from CPU
             if self.cpu_cache:
-                lru_model_name = next(iter(self.cpu_cache))
-                self._evict_from_cpu(lru_model_name)
+                eviction_candidate = self._select_eviction_candidate(
+                    self.cpu_cache, "cpu"
+                )
+                self._evict_from_cpu(eviction_candidate)
                 total_models -= 1
             # If CPU cache is empty, evict from GPU
             elif self.gpu_cache:
-                lru_model_name = next(iter(self.gpu_cache))
-                self._move_model_to_cpu(lru_model_name)
+                eviction_candidate = self._select_eviction_candidate(
+                    self.gpu_cache, "gpu"
+                )
+                self._move_model_to_cpu(eviction_candidate)
                 # Then immediately evict from CPU
-                self._evict_from_cpu(lru_model_name)
+                self._evict_from_cpu(eviction_candidate)
                 total_models -= 1
 
     def get_model(self, model_name_or_path: str) -> ModelPair:
@@ -459,8 +566,9 @@ class LRUModelCache:
         """
         # Case 1: Model is in GPU cache
         if model_name_or_path in self.gpu_cache:
-            # Move to end (most recently used)
-            self.gpu_cache.move_to_end(model_name_or_path)
+            # Update access statistics
+            self.model_stats[model_name_or_path].update_access()
+
             gpu_model_meta = self.gpu_cache[model_name_or_path]
             model = gpu_model_meta.model
             tokenizer = gpu_model_meta.tokenizer
@@ -473,6 +581,9 @@ class LRUModelCache:
             tokenizer = cpu_model_meta.tokenizer
             estimated_memory = cpu_model_meta.estimated_memory
             original_device_map = cpu_model_meta.device_map
+
+            # Update access statistics
+            self.model_stats[model_name_or_path].update_access()
 
             # Remove from CPU cache
             del self.cpu_cache[model_name_or_path]
@@ -522,6 +633,9 @@ class LRUModelCache:
         if hasattr(model, "hf_device_map"):
             original_device_map = model.hf_device_map.copy()
 
+        # Initialize statistics for this model
+        self.model_stats[model_name_or_path] = ModelStats(estimated_memory)
+
         # Add to GPU cache
         self.gpu_cache[model_name_or_path] = ModelMeta(
             model=model,
@@ -552,6 +666,8 @@ class LRUModelCache:
             del tokenizer
             del self.cpu_cache[model_name]
 
+        # Clear statistics
+        self.model_stats.clear()
         self.current_cpu_usage = 0
 
         # Force garbage collection

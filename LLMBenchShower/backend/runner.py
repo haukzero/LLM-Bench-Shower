@@ -7,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import envs
 from bench import init_all_benchmarkers
 from bench.utils import get_available_datasets
-from model_cache import LRUModelCache
+from model_cache import ModelCache
 
 
 # NOTE(haukzero): dataset_name format: dataset_name/subdataset_name. For example, "LongBench/2wikimqa"
@@ -30,7 +30,7 @@ class LLMBenchRunner:
             self.max_cached_local_models = envs.LBS_MAX_CACHED_LOCAL_MODELS
             self.max_gpu_utilization = envs.LBS_GPU_MAX_UTILIZATION
             self.max_cpu_utilization = envs.LBS_CPU_MAX_UTILIZATION
-            self.model_cache = LRUModelCache(
+            self.model_cache = ModelCache(
                 max_cached_models=self.max_cached_local_models,
                 gpu_max_utilization=self.max_gpu_utilization,
                 cpu_max_utilization=self.max_cpu_utilization,
