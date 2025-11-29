@@ -1,8 +1,0 @@
-{
-  "LongBench": "/home/tiramisu/Repos/LLM-Bench-Shower/tests/test_data/LongBench",
-  "LongBenchV2": "/home/tiramisu/Repos/LLM-Bench-Shower/tests/test_data/LongBenchV2",
-  "MR-GMS8K": "/root/share/datasets/MR-GMS8K",
-  "C-Eval": "/home/tiramisu/Repos/LLM-Bench-Shower/tests/test_data/C-Eval",
-  "CMMMU": "/root/share/datasets/CMMMU",
-  "NeedleInAHaystack": "/root/share/datasets/NeedleInAHaystack"
-}

@@ -38,3 +38,6 @@ ENV/
 # SQLite database files
 *.db
 *.sqlite
+
+# Local dataset paths
+local_dataset_paths.json
