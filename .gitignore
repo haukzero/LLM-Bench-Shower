@@ -35,3 +35,6 @@ ENV/
 *.sublime-project
 
 .ref/
+# SQLite database files
+*.db
+*.sqlite
