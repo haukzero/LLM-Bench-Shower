@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from openai import Client
 from ..benchbase import BaseBench
 from ..utils import get_dataset_path, get_sub_datasets
+from .metrics import get_metric_function
 
 
 class LongBenchV2Benchmarker(BaseBench):
@@ -108,6 +109,37 @@ class LongBenchV2Benchmarker(BaseBench):
             return answers[0] if answers else ""
         return str(answers)
 
+    def _calculate_score(self, prediction: str, ground_truths: List[str], subdataset_name: str, all_classes: List = None) -> float:
+        """Calculate the evaluation score for a prediction.
+
+        Args:
+            prediction (str): The model's prediction.
+            ground_truths (List[str]): List of ground truth answers.
+            subdataset_name (str): The name of the domain (used to select metric).
+            all_classes (List): List of all classes (for classification tasks).
+
+        Returns:
+            float: The evaluation score.
+        """
+        # For LongBenchV2, use QA F1 score as default (can be extended with domain-specific metrics)
+        metric_fn = get_metric_function(subdataset_name.lower())
+        
+        # Calculate max score among all ground truths
+        max_score = 0.0
+        kwargs = {}
+        if all_classes:
+            kwargs["all_classes"] = all_classes
+        
+        for ground_truth in ground_truths:
+            try:
+                score = metric_fn(prediction, ground_truth, **kwargs)
+                max_score = max(max_score, score)
+            except Exception as e:
+                # If metric calculation fails, return 0
+                continue
+        
+        return max_score
+
     def evaluate_local_llm(
         self,
         model: AutoModelForCausalLM,
@@ -136,8 +168,11 @@ class LongBenchV2Benchmarker(BaseBench):
             "metrics": {
                 "total": len(dataset),
                 "processed": 0,
+                "score": 0.0,
             }
         }
+        
+        all_scores = []
         
         for item in dataset:
             try:
@@ -157,20 +192,37 @@ class LongBenchV2Benchmarker(BaseBench):
                 # Remove the prompt from the response
                 response = response[len(prompt):].strip()
                 
-                ground_truth = self._extract_answer(item)
+                ground_truths = item.get("answers", item.get("answer", item.get("output", "")))
+                if isinstance(ground_truths, str):
+                    ground_truths = [ground_truths]
+                
+                # Calculate score
+                all_classes = item.get("all_classes", None)
+                score = self._calculate_score(response, ground_truths, subdataset_name, all_classes)
+                all_scores.append(score)
                 
                 results["predictions"].append({
                     "question": item.get("question", item.get("instruction", "")),
                     "prediction": response,
-                    "ground_truth": ground_truth,
+                    "ground_truths": ground_truths,
+                    "score": score,
                 })
                 results["metrics"]["processed"] += 1
             except Exception as e:
+                ground_truths = item.get("answers", item.get("answer", item.get("output", "")))
+                if isinstance(ground_truths, str):
+                    ground_truths = [ground_truths]
+                
                 results["predictions"].append({
                     "question": item.get("question", item.get("instruction", "")),
                     "prediction": f"Error: {str(e)}",
-                    "ground_truth": self._extract_answer(item),
+                    "ground_truths": ground_truths,
+                    "score": 0.0,
                 })
+        
+        # Calculate average score
+        if all_scores:
+            results["metrics"]["score"] = sum(all_scores) / len(all_scores)
         
         return results
 
@@ -203,8 +255,11 @@ class LongBenchV2Benchmarker(BaseBench):
             "metrics": {
                 "total": len(dataset),
                 "processed": 0,
+                "score": 0.0,
             }
         }
+        
+        all_scores = []
         
         for item in dataset:
             try:
@@ -223,19 +278,36 @@ class LongBenchV2Benchmarker(BaseBench):
                 )
                 
                 prediction = response.choices[0].message.content.strip()
-                ground_truth = self._extract_answer(item)
+                ground_truths = item.get("answers", item.get("answer", item.get("output", "")))
+                if isinstance(ground_truths, str):
+                    ground_truths = [ground_truths]
+                
+                # Calculate score
+                all_classes = item.get("all_classes", None)
+                score = self._calculate_score(prediction, ground_truths, subdataset_name, all_classes)
+                all_scores.append(score)
                 
                 results["predictions"].append({
                     "question": item.get("question", item.get("instruction", "")),
                     "prediction": prediction,
-                    "ground_truth": ground_truth,
+                    "ground_truths": ground_truths,
+                    "score": score,
                 })
                 results["metrics"]["processed"] += 1
             except Exception as e:
+                ground_truths = item.get("answers", item.get("answer", item.get("output", "")))
+                if isinstance(ground_truths, str):
+                    ground_truths = [ground_truths]
+                
                 results["predictions"].append({
                     "question": item.get("question", item.get("instruction", "")),
                     "prediction": f"Error: {str(e)}",
-                    "ground_truth": self._extract_answer(item),
+                    "ground_truths": ground_truths,
+                    "score": 0.0,
                 })
+        
+        # Calculate average score
+        if all_scores:
+            results["metrics"]["score"] = sum(all_scores) / len(all_scores)
         
         return results
