@@ -4,6 +4,10 @@
 
 一个支持对本地和云端LLMs做benchmark并可视化展示的系统
 
+### 整体架构
+
+![arch](./assets/arch_overview.svg)
+
 ### 效果展示
 
 TBA
