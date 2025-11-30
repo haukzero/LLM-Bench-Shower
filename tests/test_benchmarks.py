@@ -195,6 +195,7 @@ class BenchmarkTester:
             
             subdatasets = available[benchmarker_name]
             # Test first subdataset (or specified one)
+            #print("subdatasets:", subdatasets)
             test_subdataset = subdatasets[1] if len(subdatasets) > 1 else subdatasets[0]
             
             print(f"Available subdatasets: {len(subdatasets)}")

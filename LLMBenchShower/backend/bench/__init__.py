@@ -7,7 +7,10 @@ from typing import Dict
 try:
     from .c_eval import C_EvalBenchmarker
     _c_eval_available = True
-except (ImportError, TypeError, NotImplementedError):
+except Exception as e:
+    import traceback
+    print(f"❌ Error importing CEvalBenchmarker: {str(e)}")
+    traceback.print_exc()
     _c_eval_available = False
 
 try:
@@ -37,7 +40,7 @@ ALL_BENCHMARKERS = {
 if _c_eval_available:
     ALL_BENCHMARKERS["C-Eval"] = C_EvalBenchmarker
 if _cmmmu_available:
-    ALL_BENCHMARKERS["CMMMUBench"] = CMMMUBenchmarker
+    ALL_BENCHMARKERS["CMMMU"] = CMMMUBenchmarker
 if _mr_gms8k_available:
     ALL_BENCHMARKERS["MR-GMS8K"] = MR_GMS8KBenchmarker
 if _needle_available:

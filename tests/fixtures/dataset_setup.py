@@ -126,7 +126,7 @@ def setup_test_datasets(test_data_dir: str = None, num_samples: int = 5) -> str:
     create_mock_longbench_dataset(test_data_dir, num_samples)
     create_mock_longbenchv2_dataset(test_data_dir, num_samples)
     # Only create C-Eval if needed
-    # create_mock_c_eval_dataset(test_data_dir, num_samples)
+    create_mock_c_eval_dataset(test_data_dir, num_samples)
     
     print(f"\n✓ All mock datasets created successfully\n")
     return test_data_dir
