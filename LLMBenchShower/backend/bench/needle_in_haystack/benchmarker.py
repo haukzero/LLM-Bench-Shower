@@ -287,18 +287,27 @@ Please answer directly: """
         return 0.0
     
     def _generate_atc_needles(self, num_needles: int, language: str) -> Dict:
-        """Generate ATC needles for multi-needle reasoning."""
+        """Generate ATC needles for multi-needle reasoning using NeedleBench V2's power-of-2 distribution."""
         # Use built-in Chinese and English names
-        chinese_names = ["张伟", "王芳", "李娜", "刘洋", "陈静", "杨明", "黄强", "赵丽", "周杰", "吴婷"]
-        english_names = ["John", "Mary", "David", "Sarah", "Michael", "Emily", "James", "Emma", "Robert", "Olivia"]
+        chinese_names = ["张伟", "王芳", "李娜", "刘洋", "陈静", "杨明", "黄强", "赵丽", "周杰", "吴婷", 
+                       "孙涛", "朱敏", "徐辉", "林静", "赵强", "王芳", "刘娜", "陈涛", "杨丽", "吴杰"]
+        english_names = ["John", "Mary", "David", "Sarah", "Michael", "Emily", "James", "Emma", "Robert", "Olivia",
+                       "William", "Ava", "Alexander", "Sophia", "Daniel", "Isabella", "Matthew", "Charlotte", "Ethan", "Amelia"]
         
         names = chinese_names if language == "Chinese" else english_names
         
-        # Generate family relationship chain (power of 2 distribution as in NeedleBench V2)
+        # Generate family relationship chain using power-of-2 distribution as in NeedleBench V2
+        # Ensure we have enough names for the requested number of needles
         if num_needles > len(names):
-            # If not enough names, repeat the list
-            names = names * (num_needles // len(names) + 1)
+            # If not enough names, repeat the list with suffixes
+            repeated_names = []
+            for i in range((num_needles // len(names)) + 1):
+                for name in names:
+                    repeated_names.append(f"{name}{i+1}" if i > 0 else name)
+            names = repeated_names
         
+        # NeedleBench V2 uses power-of-2 distribution: 2, 4, 8, 16, 32, 64, etc.
+        # Generate a chain with exact number of needles requested
         selected_names = names[:num_needles]
         
         # Create relationship chain with proper NeedleBench V2 structure
@@ -306,12 +315,13 @@ Please answer directly: """
         for i in range(len(selected_names) - 1):
             if language == "Chinese":
                 # Use proper Chinese relationship terms (from youngest to oldest)
-                relationships_zh = ["父亲", "母亲", "祖父", "祖母", "曾祖父", "曾祖母"]
+                relationships_zh = ["父亲", "母亲", "祖父", "祖母", "曾祖父", "曾祖母", "高祖父", "高祖母"]
                 relationship_type = relationships_zh[i % len(relationships_zh)]
                 relationship = f"{selected_names[i]}是{selected_names[i+1]}的{relationship_type}"
             else:
                 # Use proper English relationship terms (from youngest to oldest)
-                relationships_en = ["father", "mother", "grandfather", "grandmother", "great-grandfather", "great-grandmother"]
+                relationships_en = ["father", "mother", "grandfather", "grandmother", "great-grandfather", "great-grandmother", 
+                                  "great-great-grandfather", "great-great-grandmother"]
                 relationship_type = relationships_en[i % len(relationships_en)]
                 relationship = f"{selected_names[i]} is the {relationship_type} of {selected_names[i+1]}"
             relationship_chain.append(relationship)
@@ -501,7 +511,7 @@ Please answer directly: """
     async def _evaluate_multi_needle_reasoning(self, model, tokenizer, params: Dict) -> Dict:
         """Evaluate multi needle reasoning task."""
         # Get parameters
-        num_needles = params.get("num_needles", 3)
+        num_needles = params.get("num_needles", 4)  # 使用基于2的幂次
         language = params.get("language", "English")
         context_length = params.get("context_length", 32768)
         depth_percent = params.get("depth_percent", 50)
@@ -517,7 +527,7 @@ Please answer directly: """
             context_tokens = context_tokens[:context_length]
             context = tokenizer_tiktoken.decode(context_tokens)
         
-        # Generate ATC needles for reasoning
+        # Generate ATC needles for reasoning - 使用NeedleBench V2的基于2的幂次分布
         atc_data = self._generate_atc_needles(num_needles, language)
         needles = atc_data['needles']
         expected_answer = atc_data['answer']
@@ -555,7 +565,7 @@ Please answer directly: """
     async def _evaluate_ancestral_trace_challenge(self, model, tokenizer, params: Dict) -> Dict:
         """Evaluate ancestral trace challenge (ATC) task."""
         # Get parameters
-        num_needles = params.get("num_needles", 5)  # ATC typically uses more needles
+        num_needles = params.get("num_needles", 8)  # ATC使用基于2的幂次的稀疏分布
         language = params.get("language", "English")
         context_length = params.get("context_length", 32768)
         depth_percent = params.get("depth_percent", 50)

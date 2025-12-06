@@ -14,10 +14,8 @@ from typing import List, Dict, Any
 from openai import Client
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# 添加backend目录到Python路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-backend_dir = os.path.join(current_dir, "LLMBenchShower", "backend")
-sys.path.insert(0, backend_dir)
+# 添加父目录到系统路径
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from bench.needle_in_haystack.benchmarker import NeedleInHaystackBenchmarker, TaskType
 
@@ -31,34 +29,49 @@ class ParameterizedBenchmarkTester:
         
         # 定义参数空间
         self.parameter_space = {
-            # 上下文长度 (tokens)
-            "context_lengths": [
-                4096,    # 短文本
-                8192,    # 中等文本
-                16384,   # 长文本
-                32768,   # 超长文本
-                65536    # 极长文本
-            ],
-            
-            # 埋针深度百分比 (0-100)
-            "depth_percents": [
-                10,      # 开头附近
-                25,      # 前四分之一
-                50,      # 中间
-                75,      # 后四分之一
-                90       # 结尾附近
-            ],
-            
-            # 针数配置
-            "needle_configs": {
-                TaskType.SINGLE_NEEDLE_RETRIEVAL: [1],
-                TaskType.MULTI_NEEDLE_RETRIEVAL: [2, 3, 5],
-                TaskType.MULTI_NEEDLE_REASONING: [3, 5, 7],
-                TaskType.ANCESTRAL_TRACE_CHALLENGE: [5]
+            # 上下文长度分组 (tokens) - 按模型能力级别分组
+            "context_length_groups": {
+                "short": [4096, 8192],          # 短文本 - 基础模型能力
+                "medium": [16384, 32768],        # 中等文本 - 标准模型能力
+                "long": [65536, 128000],         # 长文本 - 高级模型能力
+                "extra_long": [256000, 512000],  # 超长文本 - 顶级模型能力
+                "extreme": [1000000]             # 极长文本 - 前沿模型能力
             },
             
-            # 语言配置
-            "languages": ["English", "Chinese"],
+            # 埋针深度百分比 (0-100) - 更细粒度的深度分布
+            "depth_percents": [
+                0,   # 开始位置
+                10,  # 开头附近
+                21,  # 前20%处
+                31,  # 前30%处
+                42,  # 前40%处
+                52,  # 中间位置
+                63,  # 后40%处
+                73,  # 后30%处
+                84,  # 后20%处
+                94,  # 结尾附近
+                100  # 结束位置
+            ],
+            
+            # 针数配置 - 基于NeedleBench V2的2的幂次稀疏分布
+            "needle_configs": {
+                TaskType.SINGLE_NEEDLE_RETRIEVAL: [1],
+                TaskType.MULTI_NEEDLE_RETRIEVAL: [2, 4, 8],  # 2^1, 2^2, 2^3
+                TaskType.MULTI_NEEDLE_REASONING: [4, 8, 16],  # 2^2, 2^3, 2^4
+                TaskType.ANCESTRAL_TRACE_CHALLENGE: [8, 16, 32]  # 2^3, 2^4, 2^5 - 基于2的幂次的稀疏分布
+            },
+            
+            # 语言配置及对应长度缓冲
+            "language_configs": {
+                "English": {
+                    "length_buffer": 3000,  # 英文需要更大的缓冲
+                    "guide": True
+                },
+                "Chinese": {
+                    "length_buffer": 200,   # 中文需要较小的缓冲
+                    "guide": True
+                }
+            },
             
             # 任务类型
             "task_types": [
@@ -99,9 +112,24 @@ class ParameterizedBenchmarkTester:
             print(f"API客户端设置失败: {e}")
             return False
     
-    def generate_test_combinations(self, max_combinations: int = 100):
-        """生成测试参数组合"""
+    def generate_test_combinations(self, max_combinations: int = 100, length_group: str = None):
+        """生成测试参数组合
+        
+        Args:
+            max_combinations: 最大测试组合数
+            length_group: 上下文长度组 (short/medium/long/extra_long/extreme)，None表示所有组
+        """
         combinations = []
+        
+        # 获取上下文长度
+        context_lengths = []
+        if length_group and length_group in self.parameter_space["context_length_groups"]:
+            # 只使用指定组的上下文长度
+            context_lengths = self.parameter_space["context_length_groups"][length_group]
+        else:
+            # 使用所有组的上下文长度
+            for group_lengths in self.parameter_space["context_length_groups"].values():
+                context_lengths.extend(group_lengths)
         
         # 计算每个任务类型的最大测试数，确保均衡分布
         task_types = self.parameter_space["task_types"]
@@ -120,17 +148,23 @@ class ParameterizedBenchmarkTester:
             
             # 为每个针数配置生成测试
             for num_needles in num_needles_options:
-                # 为每个上下文长度和深度组合生成测试
-                for context_length in self.parameter_space["context_lengths"]:
-                    for depth_percent in self.parameter_space["depth_percents"]:
-                        for language in self.parameter_space["languages"]:
+                # 为每个语言配置生成测试
+                for language, lang_config in self.parameter_space["language_configs"].items():
+                    # 为每个上下文长度生成测试
+                    for context_length in context_lengths:
+                        # 智能选择深度点（避免过多组合）
+                        selected_depths = self._select_optimal_depths(task_type, num_needles)
+                        
+                        for depth_percent in selected_depths:
                             combination = {
                                 "context_length": context_length,
                                 "depth_percent": depth_percent,
                                 "num_needles": num_needles,
                                 "language": language,
                                 "task_type": task_type,
-                                "model_name": "deepseek-chat"
+                                "model_name": "deepseek-chat",
+                                "length_buffer": lang_config["length_buffer"],
+                                "guide": lang_config["guide"]
                             }
                             
                             task_combinations.append(combination)
@@ -145,47 +179,113 @@ class ParameterizedBenchmarkTester:
                 if len(task_combinations) >= task_max_tests:
                     break
             
-            # 如果该任务类型的组合数不足，添加一些基础测试
+            # 如果该任务类型的组合数不足，添加一些关键测试
             if len(task_combinations) < task_max_tests:
-                # 添加基础测试组合
-                base_combination = {
-                    "context_length": 16384,
-                    "depth_percent": 50,
-                    "num_needles": num_needles_options[0],
-                    "language": "English",
-                    "task_type": task_type,
-                    "model_name": "deepseek-chat"
-                }
-                if base_combination not in task_combinations:
-                    task_combinations.append(base_combination)
+                self._add_critical_combinations(task_combinations, task_type, context_lengths, task_max_tests)
             
             combinations.extend(task_combinations)
         
         # 如果总数超过限制，截断
         return combinations[:max_combinations]
     
+    def _select_optimal_depths(self, task_type, num_needles, max_depths=5):
+        """智能选择最优深度点，避免过多冗余测试
+        
+        根据任务类型和针数选择最具代表性的深度点
+        """
+        all_depths = self.parameter_space["depth_percents"]
+        
+        # 对于不同任务类型和针数，选择不同的关键深度点
+        if task_type == TaskType.SINGLE_NEEDLE_RETRIEVAL:
+            # 单针检索：重点测试极端位置和中间位置
+            key_depths = [0, 52, 100, 10, 94]
+        elif task_type == TaskType.MULTI_NEEDLE_RETRIEVAL:
+            # 多针检索：测试均匀分布的深度
+            step = len(all_depths) // max_depths
+            key_depths = all_depths[::step][:max_depths]
+        elif task_type == TaskType.MULTI_NEEDLE_REASONING:
+            # 多针推理：重点测试中间区域和后半部分
+            key_depths = [52, 63, 73, 84, 94]
+        else:  # ANCESTRAL_TRACE_CHALLENGE
+            # 祖源追溯：重点测试前半部分和中间区域
+            key_depths = [0, 21, 31, 42, 52]
+        
+        # 确保选择的深度点在有效范围内
+        selected_depths = []
+        for depth in key_depths:
+            if depth in all_depths and depth not in selected_depths:
+                selected_depths.append(depth)
+                if len(selected_depths) >= max_depths:
+                    break
+        
+        return selected_depths
+    
+    def _add_critical_combinations(self, combinations, task_type, context_lengths, max_tests):
+        """添加关键测试组合，确保覆盖最重要的参数组合
+        """
+        critical_combinations = []
+        num_needles_options = self.parameter_space["needle_configs"][task_type]
+        
+        # 添加关键组合：中间深度，不同上下文长度
+        for language, lang_config in self.parameter_space["language_configs"].items():
+            for num_needles in num_needles_options:
+                for context_length in sorted(set(context_lengths))[:3]:  # 取前3个不同的长度
+                    critical_combination = {
+                        "context_length": context_length,
+                        "depth_percent": 52,  # 中间位置
+                        "num_needles": num_needles,
+                        "language": language,
+                        "task_type": task_type,
+                        "model_name": "deepseek-chat",
+                        "length_buffer": lang_config["length_buffer"],
+                        "guide": lang_config["guide"]
+                    }
+                    
+                    if critical_combination not in combinations and critical_combination not in critical_combinations:
+                        critical_combinations.append(critical_combination)
+                        if len(combinations) + len(critical_combinations) >= max_tests:
+                            break
+                if len(combinations) + len(critical_combinations) >= max_tests:
+                    break
+            if len(combinations) + len(critical_combinations) >= max_tests:
+                break
+        
+        # 添加到主组合列表
+        combinations.extend(critical_combinations[:max_tests - len(combinations)])
+    
     async def run_single_test(self, params: Dict, use_local: bool = True):
         """运行单个测试"""
         try:
+            # 根据语言配置添加额外参数
+            language = params.get("language", "English")
+            lang_config = self.parameter_space["language_configs"].get(language, {})
+            
+            # 合并语言特定参数
+            test_params = params.copy()
+            test_params.update({
+                "length_buffer": lang_config.get("length_buffer", 1000),
+                "guide": lang_config.get("guide", True)
+            })
+            
             if use_local:
                 if self.local_model is None or self.local_tokenizer is None:
                     return None
                 
                 result = await self.benchmarker.evaluate_local_llm(
-                    self.local_model, self.local_tokenizer, params
+                    self.local_model, self.local_tokenizer, test_params
                 )
             else:
                 if self.api_client is None:
                     return None
                 
                 result = await self.benchmarker.evaluate_api_llm(
-                    self.api_client, params
+                    self.api_client, test_params
                 )
             
             # 添加测试参数信息
             result.update({
                 "test_timestamp": datetime.now().isoformat(),
-                "test_params": params
+                "test_params": test_params
             })
             
             return result
@@ -260,25 +360,55 @@ class ParameterizedBenchmarkTester:
             if results:
                 task_scores = [r.get('score', 0.0) for r in results]
                 avg_task_score = sum(task_scores) / len(task_scores)
-                print(f"  {task_type}: {len(results)} 个测试, 平均得分: {avg_task_score:.3f}")
+                max_score = max(task_scores)
+                min_score = min(task_scores)
+                print(f"  {task_type}:")
+                print(f"    测试数: {len(results)}")
+                print(f"    平均得分: {avg_task_score:.3f}")
+                print(f"    最高得分: {max_score:.3f}")
+                print(f"    最低得分: {min_score:.3f}")
         
-        # 按上下文长度统计
-        print(f"\n按上下文长度统计:")
-        for context_length in self.parameter_space["context_lengths"]:
-            context_results = [r for r in self.results if r.get('test_params', {}).get('context_length') == context_length]
-            if context_results:
-                context_scores = [r.get('score', 0.0) for r in context_results]
-                avg_context_score = sum(context_scores) / len(context_scores)
-                print(f"  {context_length} tokens: {len(context_results)} 个测试, 平均得分: {avg_context_score:.3f}")
+        # 按上下文长度组统计
+        print(f"\n按上下文长度组统计:")
+        for group_name, group_lengths in self.parameter_space["context_length_groups"].items():
+            group_results = []
+            for length in group_lengths:
+                group_results.extend([r for r in self.results if r.get('test_params', {}).get('context_length') == length])
+            
+            if group_results:
+                group_scores = [r.get('score', 0.0) for r in group_results]
+                avg_group_score = sum(group_scores) / len(group_scores)
+                print(f"  {group_name} (lengths: {group_lengths}):")
+                print(f"    测试数: {len(group_results)}")
+                print(f"    平均得分: {avg_group_score:.3f}")
         
-        # 按埋针深度统计
+        # 按语言统计
+        print(f"\n按语言统计:")
+        for language in self.parameter_space["language_configs"]:
+            lang_results = [r for r in self.results if r.get('test_params', {}).get('language') == language]
+            if lang_results:
+                lang_scores = [r.get('score', 0.0) for r in lang_results]
+                avg_lang_score = sum(lang_scores) / len(lang_scores)
+                print(f"  {language}:")
+                print(f"    测试数: {len(lang_results)}")
+                print(f"    平均得分: {avg_lang_score:.3f}")
+        
+        # 按埋针深度统计 - 只显示有结果的深度
         print(f"\n按埋针深度统计:")
-        for depth_percent in self.parameter_space["depth_percents"]:
-            depth_results = [r for r in self.results if r.get('test_params', {}).get('depth_percent') == depth_percent]
-            if depth_results:
-                depth_scores = [r.get('score', 0.0) for r in depth_results]
-                avg_depth_score = sum(depth_scores) / len(depth_scores)
-                print(f"  {depth_percent}% 深度: {len(depth_results)} 个测试, 平均得分: {avg_depth_score:.3f}")
+        depth_results_map = {}
+        for result in self.results:
+            depth = result.get('test_params', {}).get('depth_percent')
+            if depth is not None:
+                if depth not in depth_results_map:
+                    depth_results_map[depth] = []
+                depth_results_map[depth].append(result)
+        
+        # 按深度排序
+        for depth in sorted(depth_results_map.keys()):
+            depth_results = depth_results_map[depth]
+            depth_scores = [r.get('score', 0.0) for r in depth_results]
+            avg_depth_score = sum(depth_scores) / len(depth_scores)
+            print(f"  {depth}% 深度: {len(depth_results)} 个测试, 平均得分: {avg_depth_score:.3f}")
     
     def export_results(self, filename: str = None):
         """导出测试结果"""
@@ -329,15 +459,39 @@ async def main():
     print("参数化基准测试框架")
     print("="*80)
     print("支持多维度参数组合测试:")
-    print("- 上下文长度: 4096, 8192, 16384, 32768, 65536 tokens")
-    print("- 埋针深度: 10%, 25%, 50%, 75%, 90%")
+    print("- 上下文长度组:")
+    print("  * short: 4096, 8192")
+    print("  * medium: 16384, 32768")
+    print("  * long: 65536, 128000")
+    print("  * extra_long: 256000, 512000")
+    print("  * extreme: 1000000")
+    print("- 埋针深度: 0%, 10%, 21%, 31%, 42%, 52%, 63%, 73%, 84%, 94%, 100%")
     print("- 针数配置: 根据任务类型动态调整")
-    print("- 语言: 中文/英文")
+    print("- 语言: 中文/英文 (带不同长度缓冲)")
     print("- 任务类型: 单针检索/多针检索/多针推理/祖源追溯")
     print("")
     
+    # 选择上下文长度组
+    length_group_choice = input("选择上下文长度组 (1=short, 2=medium, 3=long, 4=extra_long, 5=extreme, 6=all): ")
+    length_group_map = {
+        "1": "short",
+        "2": "medium",
+        "3": "long",
+        "4": "extra_long",
+        "5": "extreme",
+        "6": None
+    }
+    length_group = length_group_map.get(length_group_choice, None)
+    
+    # 输入最大测试组合数
+    max_combinations = input("输入最大测试组合数 (默认30): ")
+    try:
+        max_combinations = int(max_combinations) if max_combinations.strip() else 30
+    except ValueError:
+        max_combinations = 30
+    
     # 生成测试组合
-    combinations = tester.generate_test_combinations(max_combinations=30)
+    combinations = tester.generate_test_combinations(max_combinations=max_combinations, length_group=length_group)
     print(f"生成了 {len(combinations)} 个测试组合")
     
     # 选择测试模式
